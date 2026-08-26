@@ -1,0 +1,11 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pywin32>=306
+python-escpos>=3.1,<4
+pystray>=0.19.5
+Pillow>=10.0.0
+pyinstaller>=6.10.0
+arabic-reshaper>=3.0.0
+python-bidi>=0.4.2
+pymupdf>=1.24.0
+python-multipart>=0.0.9

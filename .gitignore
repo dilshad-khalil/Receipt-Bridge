@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec.bak
+
+# Frontend (frontend/dist/ is build output, bundled into the .exe by
+# build.spec - not checked in, see README "Building")
+frontend/node_modules/
+frontend/dist/
