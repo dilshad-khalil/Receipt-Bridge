@@ -1,6 +1,6 @@
 """The single "Test print" action: a connectivity check and the bilingual
 (English + Arabic) test quotes, printed as one combined job. Used by the
-config UI's "Test print" button and by test_page.html.
+config UI's "Test print" button (see POST /print/test in app/main.py).
 
 Everything text-shaped (the header, the connectivity line, both quotes) is
 rendered together into one PIL image rather than mixed with native ESC/POS

@@ -220,9 +220,10 @@ def create_app() -> FastAPI:
     cfg = config_mod.load_config()
     allowed_origins = set(cfg.get("allowed_origins") or [])
     # A file:// page has an opaque origin, sent by browsers as the literal
-    # string "null". Always accepted so the bundled test_page.html works
-    # unmodified - only someone who already has local file access could load
-    # such a page in the first place, so this doesn't widen the real attack
+    # string "null". Always accepted so a plain local HTML file (no server,
+    # no build step) can call the bridge unmodified - only someone who
+    # already has local file access could load such a page in the first
+    # place, so this doesn't widen the real attack
     # surface (unlike allowing "*", which would let any LAN site through).
     allowed_origins.add("null")
 

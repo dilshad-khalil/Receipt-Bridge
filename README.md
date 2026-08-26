@@ -180,8 +180,8 @@ The single "Test print" action - one combined job containing a connectivity
 header ("If you can read this, printing from ... works"), a horizontal
 rule, the bilingual EN/AR test quotes (one English quote, its Arabic
 counterpart, each with a divider), and a QR code. It's the "Test print"
-button in the config UI and in `test_page.html`; besides confirming a
-mapping prints at all, it's also the best single check that non-Latin text
+button in the config UI's Printers page; besides confirming a mapping
+prints at all, it's also the best single check that non-Latin text
 actually comes out right on a given printer, which is the part most likely
 to silently break in ways the rest of the API can't detect.
 
@@ -285,9 +285,9 @@ list in `allowed_origins` (exact match, e.g. `https://ourapp.example.com`) -
 there is no wildcard `*` for the print/config endpoints, because anything on
 your LAN could otherwise trigger a print. A page opened via `file://` is
 always allowed too (browsers send `Origin: null` for these; only someone who
-already has the test page on their own disk could trigger this, so it's not
-a real widening of the attack surface) - this is what makes `test_page.html`
-work unmodified straight from disk.
+already has such a page on their own disk could trigger this, so it's not a
+real widening of the attack surface) - handy for a quick local HTML test
+file with no server or build step.
 
 Starting with Chrome 142, a **public** HTTPS page calling into a server on
 `localhost` also has to pass a **Private Network Access (PNA)** preflight,
@@ -401,26 +401,24 @@ reported via a message box and always logged to
    `%APPDATA%\PrintBridge\config.json`, independent of the process). Remove
    it via the row's trash-can button (confirms via a dialog) and confirm it
    disappears - both from the table and from `GET /config`.
-3. Use the row's "Test print" button, or open `test_page.html` directly
-   from disk (double-click it, or drag it into Chrome) and click "Send test
-   print" - on a real ESC/POS printer you should get a connectivity header,
-   a horizontal rule, the bilingual EN/AR test quotes, a QR code, and a
-   paper cut, all as one job. It's the best single check that a mapping
-   works at all *and* that non-Latin text (and image printing in general)
-   renders correctly, since that's the part most likely to silently break
-   on a given printer. Without hardware, Windows' "Microsoft Print to PDF"
-   will still accept the raw job (so you can confirm the plumbing works end
-   to end) but obviously won't render it as a receipt. Also try "Send
-   example receipt" (`test_page.html` only) for a look at the plain
-   `/print/text` JSON API (line items, barcode, QR).
+3. Use the row's "Test print" button - on a real ESC/POS printer you should
+   get a connectivity header, a horizontal rule, the bilingual EN/AR test
+   quotes, a QR code, and a paper cut, all as one job. It's the best single
+   check that a mapping works at all *and* that non-Latin text (and image
+   printing in general) renders correctly, since that's the part most
+   likely to silently break on a given printer. Without hardware, Windows'
+   "Microsoft Print to PDF" will still accept the raw job (so you can
+   confirm the plumbing works end to end) but obviously won't render it as
+   a receipt.
 4. Try "Print PDF" with a real multi-page PDF, ideally including a page
    with Arabic (or any non-Latin) text - it should print page by page,
    cutting between pages, proving the raster pipeline is shared correctly
    between the test-print path and PDF printing.
 5. Check the **Logs** page - every attempt from steps 3-4 (success and any
    failures, with their error messages) should show up there, newest first.
-6. Host `test_page.html` (or your real site) over `https://` somewhere and
-   repeat - watch for the one-time Chrome permission prompt described above.
+6. Host your own site over `https://` and call `/print/text` or
+   `/print/pdf` from it - watch for the one-time Chrome permission prompt
+   described above.
 
 ## Project layout
 
@@ -445,7 +443,6 @@ frontend/
   dist/                           npm run build output - bundled into the .exe
 run.py                  entry point: starts the server thread, then the tray icon
 build.spec / build.py     PyInstaller packaging (bundles frontend/dist/)
-test_page.html               standalone fetch() example (file:// and https://)
 ```
 
 Every module above has a top-of-file docstring explaining its
