@@ -47,10 +47,22 @@ def _connect() -> sqlite3.Connection:
             printer TEXT,
             ok INTEGER NOT NULL,
             error TEXT,
-            job_id TEXT
+            job_id TEXT,
+            attempts INTEGER NOT NULL DEFAULT 1,
+            served_by TEXT
         )
         """
     )
+    # `CREATE TABLE IF NOT EXISTS` above is a no-op against a jobs.db that
+    # already existed before a column was added later (`attempts` for
+    # retry-with-backoff, `served_by` for failover - see app/escpos_jobs.py)
+    # - add each by hand so older installs don't break on their first
+    # write/read after an update.
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+    if "attempts" not in existing_columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1")
+    if "served_by" not in existing_columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN served_by TEXT")
     return conn
 
 
@@ -60,6 +72,8 @@ def record(
     ok: bool,
     error: Optional[str] = None,
     job_id: Optional[str] = None,
+    attempts: int = 1,
+    served_by: Optional[str] = None,
 ) -> None:
     """Append one print-job attempt and trim history back to MAX_ENTRIES.
 
@@ -69,12 +83,24 @@ def record(
     :param ok: whether the job was accepted by the Windows print spooler.
     :param error: human-readable failure detail, if `ok` is False.
     :param job_id: the job's UUID, for cross-referencing with the text log.
+    :param attempts: how many attempts escpos_jobs.py's retry loop took -
+        1 means it worked (or failed) on the first try with no retry;
+        higher values mean a transient failure (spooler busy, printer
+        temporarily offline/unreachable) was retried before the final
+        outcome, success or failure - see app/escpos_jobs.py.
+    :param served_by: which configured target actually completed the job
+        (see app/printers.py's describe_target) - `None` if the job never
+        reached a target (e.g. an unknown logical printer) or every target
+        failed. On a mapping with backup targets, this is how "the primary
+        was down, the backup handled it" becomes visible on the Logs page,
+        not just in the app's own log file.
     """
     conn = _connect()
     try:
         conn.execute(
-            "INSERT INTO jobs (ts, endpoint, printer, ok, error, job_id) VALUES (?, ?, ?, ?, ?, ?)",
-            (time.time(), endpoint, printer, 1 if ok else 0, error, job_id),
+            "INSERT INTO jobs (ts, endpoint, printer, ok, error, job_id, attempts, served_by) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (time.time(), endpoint, printer, 1 if ok else 0, error, job_id, attempts, served_by),
         )
         conn.execute(
             "DELETE FROM jobs WHERE id NOT IN (SELECT id FROM jobs ORDER BY id DESC LIMIT ?)",
@@ -90,7 +116,8 @@ def get_recent(limit: int = MAX_ENTRIES) -> list[dict[str, Any]]:
     conn = _connect()
     try:
         rows = conn.execute(
-            "SELECT ts, endpoint, printer, ok, error, job_id FROM jobs ORDER BY id DESC LIMIT ?",
+            "SELECT ts, endpoint, printer, ok, error, job_id, attempts, served_by "
+            "FROM jobs ORDER BY id DESC LIMIT ?",
             (max(0, min(limit, MAX_ENTRIES)),),
         ).fetchall()
     finally:
@@ -103,6 +130,8 @@ def get_recent(limit: int = MAX_ENTRIES) -> list[dict[str, Any]]:
             "ok": bool(ok),
             "error": error,
             "job_id": job_id,
+            "attempts": attempts,
+            "served_by": served_by,
         }
-        for ts, endpoint, printer, ok, error, job_id in rows
+        for ts, endpoint, printer, ok, error, job_id, attempts, served_by in rows
     ]

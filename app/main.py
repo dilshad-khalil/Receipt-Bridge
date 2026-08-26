@@ -9,24 +9,28 @@ relaunch.
 """
 from __future__ import annotations
 
+import base64
+import io
 import logging
 import sys
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import uvicorn
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from PIL import Image
+from pydantic import BaseModel, Field, field_validator
 
 from app import __version__
 from app import config as config_mod
-from app import escpos_jobs, job_log, pdf_jobs, printers, startup, test_print
+from app import escpos_jobs, job_log, pdf_jobs, printers, rate_limit, startup, test_print, text_render
 
 # ---------------------------------------------------------------------------
 # Paths (dev checkout vs. PyInstaller onefile bundle)
@@ -101,17 +105,39 @@ class QRSpec(BaseModel):
     data: str
 
 
+CutMode = Literal["none", "partial", "full"]
+
+
 class PrintTextRequest(BaseModel):
     """Body for `POST /print/text` - structured receipt content: lines of
-    text, an optional barcode/QR code, and cut/cash-drawer/copies options."""
+    text, an optional barcode/QR code, and cut/cash-drawer/copies options.
+
+    `dry_run: true` skips the printer entirely and returns a rendered
+    preview image instead (see the /print/text handler) - useful for
+    checking a receipt's layout (and Arabic shaping) before committing
+    paper to it.
+    """
 
     printer: str
     lines: list[LineItem] = []
     barcode: Optional[BarcodeSpec] = None
     qr: Optional[QRSpec] = None
-    cut: bool = False
+    cut: CutMode = "none"
     open_drawer: bool = False
     copies: int = Field(default=1, ge=1, le=20)
+    dry_run: bool = False
+
+    @field_validator("cut", mode="before")
+    @classmethod
+    def _normalize_cut(cls, value: Any) -> Any:
+        """Accept the pre-v4b boolean `cut` field transparently, so
+        existing integrations sending `true`/`false` keep working
+        unchanged: `true` -> `"full"`, `false` -> `"none"`. Runs before
+        the `CutMode` Literal validation, so a string value just passes
+        through untouched."""
+        if isinstance(value, bool):
+            return "full" if value else "none"
+        return value
 
 
 class PrintRawRequest(BaseModel):
@@ -132,17 +158,46 @@ class PrintTestRequest(BaseModel):
 
 
 class PrinterMappingRequest(BaseModel):
-    """Body for `POST /config/printers` - add or update a logical->Windows
-    printer mapping."""
+    """Body for `POST /config/printers` - add or update a logical printer
+    mapping. `type` selects which of the two target shapes the rest of the
+    fields use: `"windows"` needs `windows_printer_name` (an installed,
+    driver-backed printer); `"network"` needs `host` (and optionally
+    `port`, default 9100) - a raw ESC/POS printer reachable over TCP,
+    needing no Windows driver/installation at all."""
 
     logical_name: str
-    windows_printer_name: str
+    type: Literal["windows", "network"] = "windows"
+    windows_printer_name: Optional[str] = None
+    host: Optional[str] = None
+    port: Optional[int] = Field(default=None, ge=1, le=65535)
     # None = "leave unchanged if this mapping already exists, else use the
     # module default" (see config.upsert_printer) - lets the UI resubmit
-    # this form to repoint a mapping at a different Windows printer without
-    # having to know/resend its current DPI/width_px.
+    # this form to repoint a mapping at a different target without having
+    # to know/resend its current DPI/width_px.
     dpi: Optional[int] = Field(default=None, ge=72, le=1200)
     width_px: Optional[int] = Field(default=None, ge=128, le=1024)
+
+
+class TargetSpec(BaseModel):
+    """One entry in a `POST /config/printers/{logical_name}/targets`
+    request body - the same per-target shape as `PrinterMappingRequest`,
+    minus `dpi`/`width_px` (those are mapping-level, not per-target - see
+    app/config.py's `_normalize_mapping`)."""
+
+    type: Literal["windows", "network"] = "windows"
+    windows_printer_name: Optional[str] = None
+    host: Optional[str] = None
+    port: Optional[int] = Field(default=None, ge=1, le=65535)
+
+
+class TargetsUpdateRequest(BaseModel):
+    """Body for `POST /config/printers/{logical_name}/targets` - the full,
+    ordered list of targets to fail over across for an *existing* mapping,
+    index 0 first (primary). Used by the Printers page's target-editor
+    dialog whenever a target is added, removed, or reordered - always
+    resubmits the complete list rather than a single incremental change."""
+
+    targets: list[TargetSpec] = Field(min_length=1)
 
 
 class SettingsUpdateRequest(BaseModel):
@@ -154,6 +209,7 @@ class SettingsUpdateRequest(BaseModel):
     port: Optional[int] = Field(default=None, ge=1, le=65535)
     allowed_origins: Optional[list[str]] = None
     auth_token: Optional[str] = None
+    rate_limit_per_minute: Optional[int] = Field(default=None, ge=1, le=6000)
 
 
 class StartupUpdateRequest(BaseModel):
@@ -187,12 +243,46 @@ def require_token(request: Request) -> None:
         )
 
 
+def enforce_rate_limit(request: Request) -> None:
+    """Abuse guard for /print/* - default 60 requests/minute, configurable
+    via config.json's `rate_limit_per_minute` (see the Settings page),
+    sliding-window, in-memory (see app/rate_limit.py - no external
+    dependency; this only ever runs as one local process).
+
+    Keyed by the configured auth token if one is set - by the time this
+    runs, `require_token` (see its `Depends()` ordering on each route
+    below) has already confirmed the caller supplied a matching one, so
+    this just buckets by that shared value - otherwise by the request's
+    `Origin` header, so distinct browser callers don't share one bucket
+    when there's no token to key on instead. A request with neither (no
+    auth configured, no Origin header - a bare server-to-server call)
+    falls back to one shared bucket for "no origin" callers.
+
+    Config is re-read from disk on every call (same reasoning as
+    `require_token`) so a `rate_limit_per_minute` change from the Settings
+    page takes effect immediately, no restart needed.
+    """
+    cfg = config_mod.load_config()
+    limit = cfg.get("rate_limit_per_minute") or config_mod.DEFAULT_RATE_LIMIT_PER_MINUTE
+    token = cfg.get("auth_token")
+    key = f"token:{token}" if token else f"origin:{request.headers.get('origin') or 'none'}"
+    allowed, retry_after = rate_limit.limiter.check(key, limit)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded ({limit} requests/minute). Try again shortly.",
+            headers={"Retry-After": str(int(retry_after))},
+        )
+
+
 def _record_job(
     endpoint: str,
     printer: str,
     ok: bool,
     error: Optional[str] = None,
     job_id: Optional[str] = None,
+    attempts: int = 1,
+    served_by: Optional[str] = None,
 ) -> None:
     """Best-effort write to the job history (GET /logs, the Logs page).
 
@@ -200,9 +290,40 @@ def _record_job(
     never turn a print job that actually succeeded into an error response.
     """
     try:
-        job_log.record(endpoint, printer, ok, error=error, job_id=job_id)
+        job_log.record(
+            endpoint, printer, ok, error=error, job_id=job_id, attempts=attempts, served_by=served_by
+        )
     except Exception:
         logger.exception("Failed to write job history entry")
+
+
+def _image_to_base64_png(image: Image.Image) -> str:
+    """Encode a rendered page/line image as a base64 PNG string, for the
+    `dry_run` preview responses on /print/text and /print/pdf - the
+    printer is never touched, so this is the only way the caller gets to
+    see what would have been printed."""
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _printer_statuses(printers_cfg: dict[str, Any]) -> dict[str, str]:
+    """Compute printers.get_printer_status() for every mapping concurrently.
+
+    Run in a small thread pool (rather than one after another) so a slow or
+    unreachable network printer's ~1.5s probe timeout doesn't add up
+    sequentially across N mappings every time GET /config is called (page
+    load, and this endpoint's own occasional refresh) - the whole batch
+    takes as long as the single slowest probe, not the sum of all of them.
+    """
+    if not printers_cfg:
+        return {}
+    with ThreadPoolExecutor(max_workers=min(8, len(printers_cfg))) as pool:
+        futures = {
+            name: pool.submit(printers.get_printer_status, mapping)
+            for name, mapping in printers_cfg.items()
+        }
+        return {name: future.result() for name, future in futures.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -309,20 +430,55 @@ def create_app() -> FastAPI:
 
     @app.get("/config", dependencies=[Depends(require_token)])
     def get_config() -> dict[str, Any]:
-        """Current server config: port, allowed origins, printer mappings,
-        and whether auth/startup are enabled - powers the Settings and
-        Printers pages."""
+        """Current server config: port, allowed origins, printer mappings
+        (each with a `status` field baked in), and whether auth/startup are
+        enabled - powers the Settings and Printers pages.
+
+        Status is computed here (rather than left for the frontend to poll
+        per-printer up front) so the Printers page's initial paint doesn't
+        need N+1 requests - one per mapping - just to show a status
+        indicator. Ongoing updates after that use the lighter single-printer
+        GET /config/printers/{logical_name}/status instead of re-running
+        this for the whole list every time.
+        """
         current = config_mod.load_config()
+        printers_cfg = current.get("printers", {})
+        statuses = _printer_statuses(printers_cfg)
+        printers_with_status = {
+            name: {**mapping, "status": statuses.get(name, "unknown")}
+            for name, mapping in printers_cfg.items()
+        }
         return {
             "port": current["port"],
             "allowed_origins": current.get("allowed_origins", []),
-            "printers": current.get("printers", {}),
+            "printers": printers_with_status,
             "auth_enabled": bool(current.get("auth_token")),
+            "rate_limit_per_minute": current.get(
+                "rate_limit_per_minute", config_mod.DEFAULT_RATE_LIMIT_PER_MINUTE
+            ),
             # Reflects the actual Startup-folder shortcut state (app/startup.py),
             # not a config.json field - this is what the tray's "Start with
             # Windows" checkbox and the Settings page's toggle both read/write.
             "startup_enabled": startup.is_startup_enabled(),
         }
+
+    @app.get("/config/printers/{logical_name}/status", dependencies=[Depends(require_token)])
+    def get_printer_status(logical_name: str) -> dict[str, Any]:
+        """Live status for one mapping - see printers.get_printer_status for
+        what the returned string means per printer type. Powers the
+        Printers page's per-row status indicator, polled periodically -
+        deliberately a single-printer lookup (not the whole GET /config
+        payload) so polling cost scales with how many rows are actually on
+        screen, not with re-deriving the entire config every time."""
+        cfg = config_mod.load_config()
+        try:
+            mapping = printers.resolve_printer_settings(logical_name, cfg)
+        except printers.UnknownLogicalPrinterError:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No printer configured with logical name '{logical_name}'.",
+            )
+        return {"logical_name": logical_name, "status": printers.get_printer_status(mapping)}
 
     @app.post("/config/startup", dependencies=[Depends(require_token)])
     def set_startup(body: StartupUpdateRequest) -> dict[str, Any]:
@@ -339,25 +495,116 @@ def create_app() -> FastAPI:
 
     @app.post("/config/printers", dependencies=[Depends(require_token)])
     def add_or_update_printer(body: PrinterMappingRequest) -> dict[str, Any]:
-        """Add a new logical->Windows printer mapping, or update an existing
-        one's target/DPI/width. Rejects unknown Windows printer names up
-        front so a typo doesn't silently create a mapping that will always
-        fail to print."""
-        if not printers.printer_exists(body.windows_printer_name):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Windows printer '{body.windows_printer_name}' was not found. "
-                    "Call GET /printers for the current list of installed printers."
-                ),
+        """Add a new logical printer mapping, or update an existing one's
+        target/DPI/width.
+
+        A `"windows"` mapping is rejected up front if the named Windows
+        printer isn't currently installed/visible, so a typo doesn't
+        silently create a mapping that will always fail to print. A
+        `"network"` mapping can't be validated that way - the printer might
+        just be temporarily powered off or not yet on the network - so it's
+        accepted as given and only surfaces a problem when actually used
+        (see the Printers page's status indicator and /print/* endpoints)."""
+        if body.type == "windows":
+            if not body.windows_printer_name:
+                raise HTTPException(
+                    status_code=400, detail="windows_printer_name is required for type=windows"
+                )
+            if not printers.printer_exists(body.windows_printer_name):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Windows printer '{body.windows_printer_name}' was not found. "
+                        "Call GET /printers for the current list of installed printers."
+                    ),
+                )
+            cfg = config_mod.upsert_printer(
+                body.logical_name,
+                printer_type="windows",
+                name=body.windows_printer_name,
+                dpi=body.dpi,
+                width_px=body.width_px,
             )
-        cfg = config_mod.upsert_printer(
-            body.logical_name, body.windows_printer_name, dpi=body.dpi, width_px=body.width_px
-        )
+        else:
+            if not body.host:
+                raise HTTPException(status_code=400, detail="host is required for type=network")
+            cfg = config_mod.upsert_printer(
+                body.logical_name,
+                printer_type="network",
+                host=body.host,
+                port=body.port,
+                dpi=body.dpi,
+                width_px=body.width_px,
+            )
         logger.info(
-            "config: mapped logical printer '%s' -> '%s'",
+            "config: mapped logical printer '%s' -> %s",
             body.logical_name,
-            body.windows_printer_name,
+            printers.describe_mapping(cfg["printers"][body.logical_name]),
+        )
+        return {"ok": True, "printers": cfg["printers"]}
+
+    @app.post(
+        "/config/printers/{logical_name}/targets", dependencies=[Depends(require_token)]
+    )
+    def set_printer_targets(logical_name: str, body: TargetsUpdateRequest) -> dict[str, Any]:
+        """Replace an existing mapping's ordered target list wholesale -
+        add/remove/reorder backup targets for failover (see
+        app/escpos_jobs.py's failover logic; index 0 is always tried
+        first, the rest are backups tried in order after it). Powers the
+        Printers page's target-editor dialog: every add/remove/reorder
+        there resubmits the complete list rather than a single incremental
+        change, so this endpoint only ever has to do one thing - validate
+        and replace.
+
+        Unlike `POST /config/printers`, this only edits an *existing*
+        mapping - it 404s rather than creating a new one, since the
+        target-editor dialog this powers only ever opens for a mapping
+        already in the table. Windows targets are validated the same way
+        `add_or_update_printer` validates its primary target (the named
+        printer must currently be installed/visible); network targets
+        can't be validated ahead of time the same way (see that handler's
+        docstring) so are accepted as given.
+        """
+        built: list[dict[str, Any]] = []
+        for i, t in enumerate(body.targets):
+            if t.type == "windows":
+                if not t.windows_printer_name:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Target {i + 1}: windows_printer_name is required for type=windows",
+                    )
+                if not printers.printer_exists(t.windows_printer_name):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Target {i + 1}: Windows printer '{t.windows_printer_name}' was not "
+                            "found. Call GET /printers for the current list of installed printers."
+                        ),
+                    )
+                built.append({"type": "windows", "name": t.windows_printer_name})
+            else:
+                if not t.host:
+                    raise HTTPException(
+                        status_code=400, detail=f"Target {i + 1}: host is required for type=network"
+                    )
+                built.append(
+                    {"type": "network", "host": t.host, "port": t.port or config_mod.DEFAULT_NETWORK_PORT}
+                )
+
+        try:
+            cfg = config_mod.set_printer_targets(logical_name, built)
+        except KeyError:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No printer configured with logical name '{logical_name}'.",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        logger.info(
+            "config: updated targets for logical printer '%s' -> %s",
+            logical_name,
+            printers.describe_mapping(cfg["printers"][logical_name]),
         )
         return {"ok": True, "printers": cfg["printers"]}
 
@@ -373,17 +620,21 @@ def create_app() -> FastAPI:
 
     @app.post("/config/settings", dependencies=[Depends(require_token)])
     def update_settings(body: SettingsUpdateRequest) -> dict[str, Any]:
-        """Update port/allowed_origins/auth_token. Port and allowed_origins
-        need a restart (tray -> "Restart server") to take effect, since the
-        HTTP server and CORS middleware are only built once, in
-        create_app()/BridgeServer.start() - the auth token itself does take
-        effect immediately, since require_token() re-reads config on every
+        """Update port/allowed_origins/auth_token/rate_limit_per_minute.
+        Port and allowed_origins need a restart (tray -> "Restart server")
+        to take effect, since the HTTP server and CORS middleware are only
+        built once, in create_app()/BridgeServer.start() - the auth token
+        and rate limit both take effect immediately instead, since
+        require_token()/enforce_rate_limit() re-read config on every
         request."""
         fields_set = body.model_fields_set
         cfg = config_mod.update_settings(
             port=body.port if "port" in fields_set else None,
             allowed_origins=body.allowed_origins if "allowed_origins" in fields_set else None,
             auth_token=body.auth_token if "auth_token" in fields_set else config_mod.UNSET,
+            rate_limit_per_minute=body.rate_limit_per_minute
+            if "rate_limit_per_minute" in fields_set
+            else None,
         )
         logger.info("config: settings updated (restart required to take effect)")
         return {
@@ -391,20 +642,28 @@ def create_app() -> FastAPI:
             "port": cfg["port"],
             "allowed_origins": cfg.get("allowed_origins", []),
             "auth_enabled": bool(cfg.get("auth_token")),
+            "rate_limit_per_minute": cfg.get(
+                "rate_limit_per_minute", config_mod.DEFAULT_RATE_LIMIT_PER_MINUTE
+            ),
             "restart_required": True,
         }
 
     # --- Printing ----------------------------------------------------------
 
-    @app.post("/print/text", dependencies=[Depends(require_token)])
+    @app.post("/print/text", dependencies=[Depends(require_token), Depends(enforce_rate_limit)])
     def print_text(body: PrintTextRequest) -> dict[str, Any]:
         """Render structured content (lines/barcode/QR/cut/drawer) and print
         it - the main endpoint for simple, dynamically-generated receipts.
         See the README's "Which format should I use?" section for when to
-        prefer this over /print/pdf."""
+        prefer this over /print/pdf.
+
+        `dry_run: true` renders the same content as a preview PNG (see
+        text_render.render_lines_preview) and returns it without ever
+        opening a printer connector - not logged as a job, since no print
+        was actually attempted."""
         cfg = config_mod.load_config()
         try:
-            real_name = printers.resolve_logical_printer(body.printer, cfg)
+            mapping = printers.resolve_printer_settings(body.printer, cfg)
         except printers.UnknownLogicalPrinterError:
             logger.warning("print/text: unknown logical printer '%s'", body.printer)
             _record_job("print/text", body.printer, ok=False, error="unknown logical printer")
@@ -415,35 +674,56 @@ def create_app() -> FastAPI:
                     "Add one via POST /config/printers."
                 ),
             )
+        target = printers.describe_mapping(mapping)
+
+        if body.dry_run:
+            width_px = mapping.get("width_px", config_mod.DEFAULT_PRINTER_WIDTH_PX)
+            try:
+                preview = text_render.render_lines_preview(
+                    body.lines, width_px, body.barcode, body.qr
+                )
+            except text_render.FontNotFoundError as exc:
+                raise HTTPException(status_code=500, detail=str(exc))
+            logger.info("print/text DRY-RUN logical=%s target=%s", body.printer, target)
+            return {
+                "ok": True,
+                "dry_run": True,
+                "preview_images_base64": [_image_to_base64_png(preview)],
+            }
 
         job_id = uuid.uuid4().hex
         try:
-            escpos_jobs.run_text_job(
-                real_name, body, job_name=f"{JOB_NAME_PREFIX} - {body.printer}"
+            attempts, served_by = escpos_jobs.run_text_job(
+                mapping, body, job_name=f"{JOB_NAME_PREFIX} - {body.printer}"
             )
         except escpos_jobs.PrintJobError as exc:
             logger.error(
-                "print/text FAILED job=%s logical=%s real=%s error=%s",
-                job_id, body.printer, real_name, exc,
+                "print/text FAILED job=%s logical=%s target=%s attempts=%d error=%s",
+                job_id, body.printer, target, exc.attempts, exc,
             )
-            _record_job("print/text", body.printer, ok=False, error=str(exc), job_id=job_id)
+            _record_job(
+                "print/text", body.printer, ok=False, error=str(exc), job_id=job_id,
+                attempts=exc.attempts,
+            )
             raise HTTPException(status_code=502, detail=str(exc))
 
         logger.info(
-            "print/text OK job=%s logical=%s real=%s lines=%d copies=%d",
-            job_id, body.printer, real_name, len(body.lines), body.copies,
+            "print/text OK job=%s logical=%s target=%s served_by=%s lines=%d copies=%d attempts=%d",
+            job_id, body.printer, target, served_by, len(body.lines), body.copies, attempts,
         )
-        _record_job("print/text", body.printer, ok=True, job_id=job_id)
+        _record_job(
+            "print/text", body.printer, ok=True, job_id=job_id, attempts=attempts, served_by=served_by
+        )
         return {"ok": True, "job_id": job_id}
 
-    @app.post("/print/raw", dependencies=[Depends(require_token)])
+    @app.post("/print/raw", dependencies=[Depends(require_token), Depends(enforce_rate_limit)])
     def print_raw(body: PrintRawRequest) -> dict[str, Any]:
         """Escape hatch for callers who build their own ESC/POS bytes -
         decoded from base64 and written straight to the printer, no
         interpretation."""
         cfg = config_mod.load_config()
         try:
-            real_name = printers.resolve_logical_printer(body.printer, cfg)
+            mapping = printers.resolve_printer_settings(body.printer, cfg)
         except printers.UnknownLogicalPrinterError:
             logger.warning("print/raw: unknown logical printer '%s'", body.printer)
             _record_job("print/raw", body.printer, ok=False, error="unknown logical printer")
@@ -454,28 +734,34 @@ def create_app() -> FastAPI:
                     "Add one via POST /config/printers."
                 ),
             )
+        target = printers.describe_mapping(mapping)
 
         job_id = uuid.uuid4().hex
         try:
-            escpos_jobs.run_raw_job(
-                real_name, body.data_base64, job_name=f"{JOB_NAME_PREFIX} - {body.printer} (raw)"
+            attempts, served_by = escpos_jobs.run_raw_job(
+                mapping, body.data_base64, job_name=f"{JOB_NAME_PREFIX} - {body.printer} (raw)"
             )
         except escpos_jobs.PrintJobError as exc:
             logger.error(
-                "print/raw FAILED job=%s logical=%s real=%s error=%s",
-                job_id, body.printer, real_name, exc,
+                "print/raw FAILED job=%s logical=%s target=%s attempts=%d error=%s",
+                job_id, body.printer, target, exc.attempts, exc,
             )
-            _record_job("print/raw", body.printer, ok=False, error=str(exc), job_id=job_id)
+            _record_job(
+                "print/raw", body.printer, ok=False, error=str(exc), job_id=job_id,
+                attempts=exc.attempts,
+            )
             raise HTTPException(status_code=502, detail=str(exc))
 
         logger.info(
-            "print/raw OK job=%s logical=%s real=%s bytes=%d",
-            job_id, body.printer, real_name, len(body.data_base64),
+            "print/raw OK job=%s logical=%s target=%s served_by=%s bytes=%d attempts=%d",
+            job_id, body.printer, target, served_by, len(body.data_base64), attempts,
         )
-        _record_job("print/raw", body.printer, ok=True, job_id=job_id)
+        _record_job(
+            "print/raw", body.printer, ok=True, job_id=job_id, attempts=attempts, served_by=served_by
+        )
         return {"ok": True, "job_id": job_id}
 
-    @app.post("/print/test", dependencies=[Depends(require_token)])
+    @app.post("/print/test", dependencies=[Depends(require_token), Depends(enforce_rate_limit)])
     def print_test(body: PrintTestRequest) -> dict[str, Any]:
         """The single "Test print" action: a connectivity header, a
         horizontal rule, and the bilingual EN/AR test quotes, printed
@@ -488,7 +774,7 @@ def create_app() -> FastAPI:
         """
         cfg = config_mod.load_config()
         try:
-            real_name = printers.resolve_logical_printer(body.printer, cfg)
+            mapping = printers.resolve_printer_settings(body.printer, cfg)
         except printers.UnknownLogicalPrinterError:
             logger.warning("print/test: unknown logical printer '%s'", body.printer)
             _record_job("print/test", body.printer, ok=False, error="unknown logical printer")
@@ -499,6 +785,7 @@ def create_app() -> FastAPI:
                     "Add one via POST /config/printers."
                 ),
             )
+        target = printers.describe_mapping(mapping)
 
         job_id = uuid.uuid4().hex
         try:
@@ -510,8 +797,8 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail=str(exc))
 
         try:
-            escpos_jobs.run_test_print_job(
-                real_name,
+            attempts, served_by = escpos_jobs.run_test_print_job(
+                mapping,
                 image,
                 job_name=f"{JOB_NAME_PREFIX} - {body.printer} (test print)",
                 qr_data=TEST_PRINT_QR_DATA,
@@ -519,20 +806,25 @@ def create_app() -> FastAPI:
             )
         except escpos_jobs.PrintJobError as exc:
             logger.error(
-                "print/test FAILED job=%s logical=%s real=%s error=%s",
-                job_id, body.printer, real_name, exc,
+                "print/test FAILED job=%s logical=%s target=%s attempts=%d error=%s",
+                job_id, body.printer, target, exc.attempts, exc,
             )
-            _record_job("print/test", body.printer, ok=False, error=str(exc), job_id=job_id)
+            _record_job(
+                "print/test", body.printer, ok=False, error=str(exc), job_id=job_id,
+                attempts=exc.attempts,
+            )
             raise HTTPException(status_code=502, detail=str(exc))
 
         logger.info(
-            "print/test OK job=%s logical=%s real=%s width_px=%d",
-            job_id, body.printer, real_name, body.width_px,
+            "print/test OK job=%s logical=%s target=%s served_by=%s width_px=%d attempts=%d",
+            job_id, body.printer, target, served_by, body.width_px, attempts,
         )
-        _record_job("print/test", body.printer, ok=True, job_id=job_id)
+        _record_job(
+            "print/test", body.printer, ok=True, job_id=job_id, attempts=attempts, served_by=served_by
+        )
         return {"ok": True, "job_id": job_id}
 
-    @app.post("/print/pdf", dependencies=[Depends(require_token)])
+    @app.post("/print/pdf", dependencies=[Depends(require_token), Depends(enforce_rate_limit)])
     async def print_pdf(
         file: UploadFile = File(..., description="The PDF to print."),
         printer: str = Form(..., description="Logical printer name."),
@@ -542,6 +834,10 @@ def create_app() -> FastAPI:
         ),
         cut_between_pages: bool = Form(
             default=True, description="Cut the paper between pages (the last page is always cut)."
+        ),
+        dry_run: bool = Form(
+            default=False,
+            description="If true, only rasterize and return preview images - never touches the printer.",
         ),
     ) -> dict[str, Any]:
         """Rasterize an uploaded PDF and print it, one bitmap per page.
@@ -554,10 +850,16 @@ def create_app() -> FastAPI:
         trying to translate its content into ESC/POS text commands, and
         app.escpos_jobs.run_pdf_job for why it shares its raster-sending
         code with the EN/AR test quote.
+
+        `dry_run: true` returns the rasterized page images (the same ones
+        that would otherwise be sent to the printer) without ever calling
+        run_pdf_job - rasterization already happens unconditionally, so
+        this is nearly free. Not logged as a job, since no print was
+        actually attempted.
         """
         cfg = config_mod.load_config()
         try:
-            printer_settings = printers.resolve_printer_settings(printer, cfg)
+            mapping = printers.resolve_printer_settings(printer, cfg)
         except printers.UnknownLogicalPrinterError:
             logger.warning("print/pdf: unknown logical printer '%s'", printer)
             _record_job("print/pdf", printer, ok=False, error="unknown logical printer")
@@ -568,11 +870,16 @@ def create_app() -> FastAPI:
                     "Add one via POST /config/printers."
                 ),
             )
-        real_name = printer_settings["windows_printer_name"]
-        effective_dpi = dpi if dpi is not None else printer_settings.get("dpi", 203)
-        width_px = printer_settings.get("width_px", 384)
+        target = printers.describe_mapping(mapping)
+        effective_dpi = dpi if dpi is not None else mapping.get("dpi", 203)
+        width_px = mapping.get("width_px", 384)
 
         pdf_bytes = await file.read()
+
+        # job_id is only meaningful for a real job attempt (it's what
+        # cross-references a GET /logs entry) - generated after the parse
+        # step succeeds, and only actually used past the dry_run check
+        # below, so a dry-run preview doesn't mint an unused one.
         job_id = uuid.uuid4().hex
 
         try:
@@ -582,26 +889,42 @@ def create_app() -> FastAPI:
             _record_job("print/pdf", printer, ok=False, error=str(exc), job_id=job_id)
             raise HTTPException(status_code=400, detail=str(exc))
 
+        if dry_run:
+            logger.info(
+                "print/pdf DRY-RUN logical=%s target=%s pages=%d dpi=%d width_px=%d",
+                printer, target, len(images), effective_dpi, width_px,
+            )
+            return {
+                "ok": True,
+                "dry_run": True,
+                "preview_images_base64": [_image_to_base64_png(img) for img in images],
+            }
+
         try:
-            escpos_jobs.run_pdf_job(
-                real_name,
+            attempts, served_by = escpos_jobs.run_pdf_job(
+                mapping,
                 images,
                 job_name=f"{JOB_NAME_PREFIX} - {printer} (PDF, {len(images)}p)",
                 cut_between_pages=cut_between_pages,
             )
         except escpos_jobs.PrintJobError as exc:
             logger.error(
-                "print/pdf FAILED job=%s logical=%s real=%s error=%s",
-                job_id, printer, real_name, exc,
+                "print/pdf FAILED job=%s logical=%s target=%s attempts=%d error=%s",
+                job_id, printer, target, exc.attempts, exc,
             )
-            _record_job("print/pdf", printer, ok=False, error=str(exc), job_id=job_id)
+            _record_job(
+                "print/pdf", printer, ok=False, error=str(exc), job_id=job_id,
+                attempts=exc.attempts,
+            )
             raise HTTPException(status_code=502, detail=str(exc))
 
         logger.info(
-            "print/pdf OK job=%s logical=%s real=%s pages=%d dpi=%d width_px=%d",
-            job_id, printer, real_name, len(images), effective_dpi, width_px,
+            "print/pdf OK job=%s logical=%s target=%s served_by=%s pages=%d dpi=%d width_px=%d attempts=%d",
+            job_id, printer, target, served_by, len(images), effective_dpi, width_px, attempts,
         )
-        _record_job("print/pdf", printer, ok=True, job_id=job_id)
+        _record_job(
+            "print/pdf", printer, ok=True, job_id=job_id, attempts=attempts, served_by=served_by
+        )
         return {"ok": True, "job_id": job_id, "pages_printed": len(images)}
 
     # --- Job history ---------------------------------------------------------

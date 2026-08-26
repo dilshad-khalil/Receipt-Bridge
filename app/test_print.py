@@ -18,14 +18,24 @@ quotes with a plain horizontal rule between them, it goes into the same
 image rather than being printed separately in ESC/POS text mode first (see
 app/escpos_jobs.py's run_test_print_job for how a QR code - genuinely
 native ESC/POS - still gets appended after this image in the same job).
+
+The font-loading/Arabic-shaping/word-wrap primitives used below now live in
+app/text_render.py, shared with `/print/text`'s per-line Arabic rendering
+(app/escpos_jobs.py) and its dry-run preview (app/main.py) - this module
+keeps only what's specific to the test print itself: its fixed EN/AR quote
+content and the particular header/quotes/footer layout.
 """
 from __future__ import annotations
 
-from pathlib import Path
-
-import arabic_reshaper
-from bidi.algorithm import get_display
 from PIL import Image, ImageDraw, ImageFont
+
+from app.text_render import FontNotFoundError, load_font, shape_arabic, wrap_to_width
+
+# Re-exported for backward compatibility - main.py previously caught
+# `test_print.FontNotFoundError`; the canonical definition now lives in
+# app/text_render.py (shared with escpos_jobs.py's per-line Arabic
+# rendering and main.py's /print/text dry-run preview).
+__all__ = ["FontNotFoundError", "build_test_print_image"]
 
 QUOTE_EN = "The best way to predict the future is to create it."
 ATTRIBUTION_EN = "Peter Drucker"
@@ -33,58 +43,11 @@ ATTRIBUTION_EN = "Peter Drucker"
 QUOTE_AR = "أفضل وسيلة للتنبؤ بالمستقبل هي أن تصنعه بنفسك."
 ATTRIBUTION_AR = "بيتر دركر"
 
-# Windows ships all three; Tahoma has historically had the most complete and
-# legible Arabic glyph set, so it's tried first.
-_FONT_CANDIDATES = [
-    r"C:\Windows\Fonts\tahoma.ttf",
-    r"C:\Windows\Fonts\segoeui.ttf",
-    r"C:\Windows\Fonts\arial.ttf",
-]
-
-
-class FontNotFoundError(Exception):
-    """Raised when none of the candidate Windows fonts could be found."""
-
-
-def _load_font(size: int) -> ImageFont.FreeTypeFont:
-    for path in _FONT_CANDIDATES:
-        if Path(path).exists():
-            return ImageFont.truetype(path, size)
-    raise FontNotFoundError(
-        "No Unicode TrueType font found (looked for Tahoma / Segoe UI / "
-        r"Arial under C:\Windows\Fonts) - needed to render the test print "
-        "as a bitmap."
-    )
-
-
-def _shape_arabic(text: str) -> str:
-    """Reshape Arabic codepoints into contextual (joined) letterforms, then
-    reorder into left-to-right *visual* order - PIL draws strings character
-    by character in the order given and doesn't run the bidi algorithm
-    itself, so this has to happen before drawing."""
-    return get_display(arabic_reshaper.reshape(text))
-
-
-def _wrap_to_width(
-    draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int
-) -> list[str]:
-    """Greedy word-wrap by measured pixel width. Wrapping happens on
-    logical-order text (splitting on spaces is direction-agnostic); each
-    wrapped line is shaped/reordered independently by the caller before
-    drawing."""
-    words = text.split(" ")
-    lines: list[str] = []
-    current = ""
-    for word in words:
-        candidate = f"{current} {word}".strip()
-        if not current or draw.textlength(candidate, font=font) <= max_width:
-            current = candidate
-        else:
-            lines.append(current)
-            current = word
-    if current:
-        lines.append(current)
-    return lines
+# Thin aliases so the rest of this module reads exactly as it did before the
+# shared-primitives extraction into app/text_render.py.
+_load_font = load_font
+_shape_arabic = shape_arabic
+_wrap_to_width = wrap_to_width
 
 
 def build_test_print_image(width_px: int = 384, printer_label: str = "") -> Image.Image:

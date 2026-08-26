@@ -9,7 +9,13 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react"
 import { api } from "@/lib/api"
-import type { ConfigResponse, HealthResponse, JobLogEntry, WindowsPrinter } from "@/lib/types"
+import type {
+  ConfigResponse,
+  HealthResponse,
+  JobLogEntry,
+  PrinterStatus,
+  WindowsPrinter,
+} from "@/lib/types"
 
 interface AsyncState<T> {
   data: T | null
@@ -78,4 +84,50 @@ export function useConfig() {
 export function useLogs(limit = 200): AsyncState<JobLogEntry[]> & { refresh: () => void } {
   const { data, loading, error, refresh } = useAsync<{ jobs: JobLogEntry[] }>(() => api.logs(limit))
   return { data: data?.jobs ?? null, loading, error, refresh }
+}
+
+/** Live status for one printer mapping, polled every `intervalMs` (default
+ * 15s) via `GET /config/printers/{logical_name}/status` - the Printers
+ * page's per-row status indicator. Deliberately its own tiny poller per row
+ * rather than a page-wide timer that re-fetches all of `GET /config`, so
+ * polling cost scales with how many mappings are actually rendered.
+ *
+ * `initialStatus` (the summary `GET /config` already computed) seeds the
+ * first render so the indicator doesn't flash "Unknown" while this hook's
+ * own first poll is still in flight. */
+export function usePrinterStatus(
+  logicalName: string,
+  initialStatus?: PrinterStatus,
+  intervalMs = 15000,
+): { status: PrinterStatus | null; loading: boolean } {
+  const [status, setStatus] = useState<PrinterStatus | null>(initialStatus ?? null)
+  const [loading, setLoading] = useState(initialStatus === undefined)
+
+  useEffect(() => {
+    let cancelled = false
+    const poll = () => {
+      api
+        .printerStatus(logicalName)
+        .then((res) => {
+          if (!cancelled) {
+            setStatus(res.status)
+            setLoading(false)
+          }
+        })
+        .catch(() => {
+          // A transient error probing status shouldn't wipe out a
+          // previously-known-good status - just leave it stale until the
+          // next successful poll.
+          if (!cancelled) setLoading(false)
+        })
+    }
+    poll()
+    const id = setInterval(poll, intervalMs)
+    return () => {
+      cancelled = true
+      clearInterval(id)
+    }
+  }, [logicalName, intervalMs])
+
+  return { status, loading }
 }

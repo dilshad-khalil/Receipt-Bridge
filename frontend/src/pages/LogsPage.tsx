@@ -42,6 +42,35 @@ function StatusBadge({ ok }: { ok: boolean }) {
   )
 }
 
+/** Attempt count, only called out when a retry actually happened (see
+ * app/escpos_jobs.py's retry-with-backoff) - a plain "1" would just be
+ * visual noise for the overwhelmingly common case of a job that worked
+ * first try, but a printer that needed retries (or exhausted them and
+ * still failed) is exactly the kind of flaky behavior this column exists
+ * to surface. */
+function AttemptsCell({ attempts }: { attempts: number }) {
+  if (attempts <= 1) {
+    return <span className="text-muted-foreground">1</span>
+  }
+  return (
+    <Badge variant="outline" className="font-normal text-muted-foreground">
+      {attempts} attempts
+    </Badge>
+  )
+}
+
+/** Which configured target actually completed the job (see
+ * app/printers.py's describe_target) - only meaningfully different from
+ * the "Printer" column when a mapping has failover backups and the
+ * primary was down, so an em-dash is shown rather than repeating the
+ * logical name for the common single-target case. */
+function ServedByCell({ job }: { job: JobLogEntry }) {
+  if (!job.served_by) {
+    return <span className="text-muted-foreground">-</span>
+  }
+  return <span className="text-muted-foreground">{job.served_by}</span>
+}
+
 function LogRow({ job }: { job: JobLogEntry }) {
   return (
     <TableRow>
@@ -53,7 +82,13 @@ function LogRow({ job }: { job: JobLogEntry }) {
       </TableCell>
       <TableCell>{job.printer ?? <span className="text-muted-foreground">-</span>}</TableCell>
       <TableCell>
+        <ServedByCell job={job} />
+      </TableCell>
+      <TableCell>
         <StatusBadge ok={job.ok} />
+      </TableCell>
+      <TableCell>
+        <AttemptsCell attempts={job.attempts} />
       </TableCell>
       <TableCell className="max-w-xs truncate text-muted-foreground" title={job.error ?? ""}>
         {job.error ?? ""}
@@ -103,7 +138,9 @@ export function LogsPage() {
                     <TableHead>Time</TableHead>
                     <TableHead>Endpoint</TableHead>
                     <TableHead>Printer</TableHead>
+                    <TableHead>Served by</TableHead>
                     <TableHead>Status</TableHead>
+                    <TableHead>Attempts</TableHead>
                     <TableHead>Error</TableHead>
                   </TableRow>
                 </TableHeader>

@@ -14,13 +14,18 @@
  */
 import type {
   ConfigResponse,
+  CutMode,
   HealthResponse,
   JobLogEntry,
+  LineItem,
   PrinterMappingRequest,
+  PrinterStatus,
   PrintJobResponse,
   PrintPdfResponse,
+  PrintPreviewResponse,
   SettingsResponse,
   SettingsUpdateRequest,
+  TargetSpecRequest,
   WindowsPrinter,
 } from "./types"
 
@@ -87,6 +92,25 @@ export const api = {
       body: json(body),
     }),
 
+  /** Live status for one mapping - see app/printers.py's get_printer_status.
+   * Used by the Printers page's per-row status indicator, polled
+   * periodically (see hooks/usePrintBridge.ts's usePrinterStatus). */
+  printerStatus: (logicalName: string) =>
+    request<{ logical_name: string; status: PrinterStatus }>(
+      `/config/printers/${encodeURIComponent(logicalName)}/status`,
+    ),
+
+  /** Replace an existing mapping's ordered target list wholesale - the
+   * Printers page's target-editor dialog calls this on every
+   * add/remove/reorder, resubmitting the complete list rather than a
+   * single incremental change (see POST /config/printers/{name}/targets).
+   * Index 0 is the primary, tried first; the rest are failover backups. */
+  setPrinterTargets: (logicalName: string, targets: TargetSpecRequest[]) =>
+    request<{ ok: true; printers: ConfigResponse["printers"] }>(
+      `/config/printers/${encodeURIComponent(logicalName)}/targets`,
+      { method: "POST", body: json({ targets }) },
+    ),
+
   deletePrinter: (logicalName: string) =>
     request<{ ok: true; printers: ConfigResponse["printers"] }>(
       `/config/printers/${encodeURIComponent(logicalName)}`,
@@ -117,6 +141,28 @@ export const api = {
     form.append("file", file)
     form.append("cut_between_pages", String(cutBetweenPages))
     return request<PrintPdfResponse>("/print/pdf", { method: "POST", body: form })
+  },
+
+  /** Dry-run preview of a `/print/text` job - renders `lines` (plus an
+   * optional cut mode, purely for parity with a real request) to an image
+   * without ever touching the printer (see POST /print/text's `dry_run`
+   * field and app/text_render.py's render_lines_preview). */
+  previewText: (logicalName: string, lines: LineItem[], cut: CutMode = "none") =>
+    request<PrintPreviewResponse>("/print/text", {
+      method: "POST",
+      body: json({ printer: logicalName, lines, cut, dry_run: true }),
+    }),
+
+  /** Dry-run preview of a `/print/pdf` job - rasterizes the PDF and
+   * returns its page images without printing (see POST /print/pdf's
+   * `dry_run` field). Nearly free: rasterization already has to happen
+   * either way. */
+  previewPdf: (logicalName: string, file: File) => {
+    const form = new FormData()
+    form.append("printer", logicalName)
+    form.append("file", file)
+    form.append("dry_run", "true")
+    return request<PrintPreviewResponse>("/print/pdf", { method: "POST", body: form })
   },
 
   logs: (limit = 200) => request<{ jobs: JobLogEntry[] }>(`/logs?limit=${limit}`),

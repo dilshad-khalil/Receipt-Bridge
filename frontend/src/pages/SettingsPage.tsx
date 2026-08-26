@@ -30,6 +30,7 @@ export function SettingsPage() {
   const [port, setPort] = useState("9187")
   const [origins, setOrigins] = useState<string[]>([])
   const [tokenField, setTokenField] = useState(getToken())
+  const [rateLimit, setRateLimit] = useState("60")
   const [saving, setSaving] = useState(false)
   const [startupBusy, setStartupBusy] = useState(false)
 
@@ -41,6 +42,7 @@ export function SettingsPage() {
     if (config && !initialized) {
       setPort(String(config.port))
       setOrigins(config.allowed_origins.length > 0 ? config.allowed_origins : [""])
+      setRateLimit(String(config.rate_limit_per_minute))
       setInitialized(true)
     }
   }, [config, initialized])
@@ -64,12 +66,18 @@ export function SettingsPage() {
       toast.error("Port must be a number between 1 and 65535")
       return
     }
+    const rateLimitNum = Number(rateLimit)
+    if (!Number.isInteger(rateLimitNum) || rateLimitNum < 1) {
+      toast.error("Rate limit must be a positive whole number")
+      return
+    }
     setSaving(true)
     try {
       await api.updateSettings({
         port: portNum,
         allowed_origins: origins.map((o) => o.trim()).filter(Boolean),
         auth_token: tokenField.trim() || null,
+        rate_limit_per_minute: rateLimitNum,
       })
       toast.success(
         "Settings saved. Restart Print Bridge from the tray icon for the port/origins change to take effect.",
@@ -159,6 +167,24 @@ export function SettingsPage() {
                   <Plus />
                   Add origin
                 </Button>
+              </div>
+
+              <div className="max-w-40">
+                <Label htmlFor="rate-limit" className="mb-1.5">
+                  Rate limit (req/min)
+                </Label>
+                <p className="mb-2 text-xs text-muted-foreground">
+                  Caps requests to <code>/print/*</code> per minute, keyed by the auth token (if
+                  set) or by the caller&apos;s origin. Takes effect immediately - no restart
+                  needed.
+                </p>
+                <Input
+                  id="rate-limit"
+                  type="number"
+                  min={1}
+                  value={rateLimit}
+                  onChange={(e) => setRateLimit(e.target.value)}
+                />
               </div>
 
               <div>
